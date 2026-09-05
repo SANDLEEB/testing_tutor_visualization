@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: codeflow
+      POSTGRES_PASSWORD: codeflow
+      POSTGRES_DB: codeflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - codeflow_pgdata:/var/lib/postgresql/data
+
+volumes:
+  codeflow_pgdata:

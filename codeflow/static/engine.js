@@ -1,5 +1,5 @@
 /**
- * CodeFlow Visualizer — GraphAnimator
+ * Testing Tutor — GraphAnimator
  * Self-contained canvas animation engine for CFGs, DU chains,
  * dominator trees, and call graphs.
  */

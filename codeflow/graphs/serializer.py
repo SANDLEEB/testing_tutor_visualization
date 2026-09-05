@@ -48,16 +48,21 @@ def _layered_layout(nodes: List[Dict], edges: List[Dict]) -> Dict[int, Dict]:
     ids  = [n['id'] for n in nodes]
     adj  = {i: [] for i in ids}
     for e in edges:
-        if e['type'] != 'back-edge' and e['from'] in adj:
+        if e['type'] not in ('back-edge', 'recursive') and e['from'] in adj:
             adj[e['from']].append(e['to'])
 
-    # Longest path rank
+    # Longest-path rank via Bellman-Ford-style relaxation — only correct/
+    # guaranteed-terminating for a DAG. CFGs mark loops as 'back-edge' and
+    # are excluded above, but call graphs only label direct self-recursion
+    # as 'recursive' — a longer cycle (mutual recursion, A calls B calls A)
+    # isn't labeled at all and would relax forever. Bellman-Ford only ever
+    # needs |V|-1 passes for a true DAG, so bounding the loop is both the
+    # standard termination check and a hard safety net against any cycle.
     rank = {}
     entry = next((n['id'] for n in nodes if n['type'] == 'entry'), ids[0])
     rank[entry] = 0
 
-    changed = True
-    while changed:
+    for _ in range(len(ids) + 1):
         changed = False
         for nid in ids:
             for child in adj.get(nid, []):
@@ -65,6 +70,8 @@ def _layered_layout(nodes: List[Dict], edges: List[Dict]) -> Dict[int, Dict]:
                 if rank.get(child, -1) < new_r:
                     rank[child] = new_r
                     changed = True
+        if not changed:
+            break
 
     for nid in ids:
         if nid not in rank:

@@ -118,3 +118,4 @@ class CallGraphBuilder:
             'metadata': {'name': 'Call Graph', 'source_code': msg,
                          'paths': [], 'prime_paths': [], 'du_chains': {}},
         }
+
