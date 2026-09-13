@@ -12,6 +12,7 @@ import config
 from auth import routes as auth_routes
 from auth.db import init_db
 from auth.gateway import require_role
+from core.bootstrap import bootstrap_admin_from_env
 from pages.login_page    import create_login_page
 from pages.admin_page    import create_admin_page
 from pages.instructor_assignments_page import create_instructor_assignments_page
@@ -37,6 +38,7 @@ from pages.student_topics_page import create_student_topics_page
 # scaffolding are live so far.
 
 app.on_startup(init_db)
+app.on_startup(bootstrap_admin_from_env)
 auth_routes.register(app)
 
 ACCENT = '#0969da'  # the app's one brand color — every `color='primary'` element picks this up
