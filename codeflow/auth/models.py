@@ -27,6 +27,11 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
     full_name: Mapped[str] = mapped_column(String, nullable=False, default='')
+    # Campus-wide ID — optional (blank for accounts created before this existed, or
+    # anyone who skips it), settable at signup or later from the instructor Students
+    # roster page (inline, same pattern as Enrollment.section). Searchable alongside
+    # name/email wherever an instructor picks specific students (pages/access_fields.py).
+    cwid: Mapped[str] = mapped_column(String, nullable=False, default='')
     hashed_password: Mapped[str | None] = mapped_column(String, nullable=True)
     auth_provider: Mapped[AuthProvider] = mapped_column(
         Enum(AuthProvider), nullable=False, default=AuthProvider.password

@@ -18,8 +18,11 @@ import re
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from core.course_service import list_students
-from core.models import Assignment, AssignmentSubmission, Concept, ConceptMastery, Question, QuestionAttempt
+from core.course_service import get_enrollment, list_students
+from core.models import (
+    AccessScope, Assignment, AssignmentSubmission, Concept, ConceptMastery, Question,
+    QuestionAccessStudent, QuestionAttempt,
+)
 
 P_L0 = 0.30    # prior probability of already knowing a concept, before any practice
 P_T = 0.15     # probability of learning it after one practice opportunity
@@ -204,6 +207,10 @@ def list_student_mastery_matrix(session: Session, course_id: int) -> list[dict]:
 def pick_next_question(session: Session, user_id: int, course_id: int) -> Question | None:
     """Adaptive selection: weakest unmastered concept first, then an
     unattempted question in it, else the one this student saw longest ago.
+
+    Only ever picks from questions this student can actually see — Question.access_scope
+    (core/question_service.set_question_access) restricts some to one/more sections or a
+    specific student list, same as an Assignment can be restricted.
     """
     mastery_rows = list_mastery(session, user_id, course_id)
     unmastered = sorted((m for m in mastery_rows if not m['is_mastered']), key=lambda m: m['mastery'])
@@ -213,13 +220,33 @@ def pick_next_question(session: Session, user_id: int, course_id: int) -> Questi
     attempted_ids = set(session.scalars(
         select(QuestionAttempt.question_id).where(QuestionAttempt.user_id == user_id)
     ))
+    enrollment = get_enrollment(session, user_id)
+    student_section = enrollment.section if enrollment else ''
 
     for m in concept_order:
-        questions = list(session.scalars(
+        candidates = list(session.scalars(
             select(Question).where(
                 Question.concept_id == m['concept'].id, Question.published.is_(True),
             )
         ))
+        if not candidates:
+            continue
+
+        student_scoped_ids = [q.id for q in candidates if q.access_scope == AccessScope.students]
+        granted_ids = set()
+        if student_scoped_ids:
+            granted_ids = set(session.scalars(
+                select(QuestionAccessStudent.question_id).where(
+                    QuestionAccessStudent.student_id == user_id,
+                    QuestionAccessStudent.question_id.in_(student_scoped_ids),
+                )
+            ))
+        questions = [
+            q for q in candidates
+            if q.access_scope == AccessScope.course
+            or (q.access_scope == AccessScope.sections and student_section in (q.access_sections or []))
+            or (q.access_scope == AccessScope.students and q.id in granted_ids)
+        ]
         if not questions:
             continue
 

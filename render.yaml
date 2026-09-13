@@ -1,0 +1,46 @@
+databases:
+  - name: testing-tutor-db
+    plan: free
+    databaseName: codeflow
+    user: codeflow
+
+services:
+  - type: web
+    name: testing-tutor
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /login
+    envVars:
+      # Injected directly from the managed Postgres instance above — never
+      # hardcode credentials here.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: testing-tutor-db
+          property: connectionString
+
+      # Signs the NiceGUI session cookie. generateValue makes Render create
+      # a random secret once at first deploy instead of it living in git.
+      - key: SESSION_SECRET
+        generateValue: true
+
+      # Secrets/config with no sensible default — set these in the Render
+      # dashboard after the first deploy (sync: false keeps them out of
+      # this file and out of git).
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: MICROSOFT_CLIENT_ID
+        sync: false
+      - key: MICROSOFT_CLIENT_SECRET
+        sync: false

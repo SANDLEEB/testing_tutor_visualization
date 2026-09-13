@@ -34,7 +34,7 @@ def create_instructor_student_detail_page(student_id: int):
         if student is None or enrollment is None or enrollment.course_id != course_id:
             ui.label('Student not found in this course.').classes('text-red-500 text-lg m-4')
             return
-        name, email = student.full_name, student.email
+        name, email, section = student.full_name, student.email, enrollment.section
 
         knowledge = []
         for t in list_topics_with_published_content(session, course_id):
@@ -63,7 +63,12 @@ def create_instructor_student_detail_page(student_id: int):
 
     ui.button('← Back to Students', on_click=lambda: ui.navigate.to('/instructor/students')) \
         .props('flat dense size=sm').classes('mb-2')
-    ui.label(name).classes('text-2xl font-bold mb-1')
+    with ui.row().classes('items-center gap-2 mb-1'):
+        ui.label(name).classes('text-2xl font-bold')
+        if section:
+            ui.label(f'Section {section}').classes(
+                'text-[11px] font-semibold px-2 py-0.5 rounded-full bg-gray-100 text-gray-500'
+            )
     ui.label(email).classes('text-sm text-gray-500 mb-6')
 
     # ── Knowledge graph ──────────────────────────────────────────────────

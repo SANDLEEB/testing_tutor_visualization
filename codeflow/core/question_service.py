@@ -2,10 +2,12 @@
 Authoring Service. Students only ever see published rows (mirrors
 core/content_service.py's draft → publish flow for ContentItem).
 """
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from core.models import Concept, Question, QuestionAttempt, QuestionSource, QuestionType
+from core.models import (
+    AccessScope, Concept, Question, QuestionAccessStudent, QuestionAttempt, QuestionSource, QuestionType,
+)
 
 
 def create_question(
@@ -49,7 +51,40 @@ def set_published(session: Session, question: Question, published: bool) -> None
     question.published = published
 
 
+def get_question_access_student_ids(session: Session, question_id: int) -> list[int]:
+    return list(session.scalars(
+        select(QuestionAccessStudent.student_id).where(QuestionAccessStudent.question_id == question_id)
+    ))
+
+
+def set_question_access(
+    session: Session, question: Question, *, scope: AccessScope,
+    sections: list[str] | None = None, student_ids: list[int] | None = None,
+) -> None:
+    """See core/assignment_service.set_assignment_access — same 3-way scope, same
+    clear-the-unused-fields-on-switch behavior, applied to Question instead."""
+    question.access_scope = scope
+    question.access_sections = sorted(set(sections)) if scope == AccessScope.sections and sections else []
+    session.execute(delete(QuestionAccessStudent).where(QuestionAccessStudent.question_id == question.id))
+    if scope == AccessScope.students:
+        for student_id in set(student_ids or []):
+            session.add(QuestionAccessStudent(question_id=question.id, student_id=student_id))
+
+
+def student_can_access_question(
+    question: Question, *, student_id: int, student_section: str, access_student_ids: set[int] = frozenset(),
+) -> bool:
+    """See core/assignment_service.student_can_access_assignment — same logic, applied
+    to Question. access_student_ids only matters when access_scope is 'students'."""
+    if question.access_scope == AccessScope.course:
+        return True
+    if question.access_scope == AccessScope.sections:
+        return student_section in (question.access_sections or [])
+    return student_id in access_student_ids
+
+
 def delete_question(session: Session, question: Question) -> None:
+    session.execute(delete(QuestionAccessStudent).where(QuestionAccessStudent.question_id == question.id))
     session.delete(question)
 
 

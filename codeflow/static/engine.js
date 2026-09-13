@@ -762,6 +762,36 @@ class GraphAnimator {
     if (!this.isPlaying) this._scheduleNextStep();
   }
 
+  // ─── Static (non-animated) Feedback API ────────────────────────────────
+  // Same end state as playPath()/animateDuChain(), applied instantly — no particle
+  // travel, no step queue — for the instructor's "static feedback" toggle.
+
+  showPathStatic(nodeSequence) {
+    this.reset();
+    for (let i = 0; i < nodeSequence.length; i++) {
+      const nodeId = nodeSequence[i];
+      this.nodeStates[nodeId] = 'visited';
+      this.coveredNodes.add(nodeId);
+      if (i > 0) {
+        const ei = this._findEdgeIndex(nodeSequence[i - 1], nodeId);
+        if (ei >= 0) {
+          this.edgeStates[ei] = 'visited';
+          this.coveredEdges.add(ei);
+        }
+      }
+    }
+    this._updateCoverageCB?.();
+  }
+
+  showDuChainStatic(defNodeId, useNodeIds) {
+    this.nodeStates[defNodeId] = 'def';
+    useNodeIds.forEach(uid => {
+      this.nodeStates[uid] = 'use';
+      const ei = this._findEdgeIndex(defNodeId, uid);
+      if (ei >= 0) this.edgeStates[ei] = 'du-path';
+    });
+  }
+
   _scheduleNextStep() {
     if (this.currentStep >= this.steps.length - 1) {
       this.isPlaying = false;

@@ -42,6 +42,8 @@ def create_login_page():
 
             full_name_input = ui.input(label='Full name').classes('w-full')
             full_name_input.set_visibility(False)
+            cwid_input = ui.input(label='Campus ID / CWID (optional)').classes('w-full')
+            cwid_input.set_visibility(False)
             role_toggle = ui.toggle(list(_SIGNUP_ROLES), value='Student').classes('w-full')
             role_toggle.set_visibility(False)
             email_input = ui.input(label='Email').classes('w-full')
@@ -82,7 +84,9 @@ def create_login_page():
                             show_error('Select your institution and course first.')
                             return
                         account_role, enrollment_role = _SIGNUP_ROLES[role_toggle.value]
-                        user = create_password_user(session, email, password, full_name, role=account_role)
+                        user = create_password_user(
+                            session, email, password, full_name, role=account_role, cwid=cwid_input.value,
+                        )
                         enroll_user(session, user_id=user.id, course_id=course_select.value, role=enrollment_role)
                     else:
                         user = authenticate_password(session, email, password)
@@ -91,7 +95,7 @@ def create_login_page():
                             return
                     _log_in(user)
 
-            for _field in (full_name_input, email_input, password_input):
+            for _field in (full_name_input, cwid_input, email_input, password_input):
                 _field.on('keydown.enter', submit)
 
             ui.button('Sign In', on_click=submit, color='primary').classes('w-full mt-2')
@@ -100,6 +104,7 @@ def create_login_page():
                 mode['signup'] = not mode['signup']
                 title.text = 'Create account' if mode['signup'] else 'Sign in'
                 full_name_input.set_visibility(mode['signup'])
+                cwid_input.set_visibility(mode['signup'])
                 role_toggle.set_visibility(mode['signup'])
                 institution_select.set_visibility(mode['signup'])
                 course_select.set_visibility(mode['signup'])

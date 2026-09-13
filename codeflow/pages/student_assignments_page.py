@@ -2,16 +2,19 @@
 import asyncio
 import html
 import json
+from datetime import datetime, timezone
 
 from nicegui import app, ui
 
 from auth.db import get_session
 from auth.gateway import require_course
 from core.assignment_service import (
-    get_assignment, latest_submission, list_assignments, list_submissions, mark_assignment_opened,
-    submit_and_grade,
+    AssignmentPastDueError, get_assignment, get_assignment_access_student_ids, latest_submission,
+    list_due_date_overrides, list_submissions, list_visible_assignments_for_student, mark_assignment_opened,
+    resolve_due_at, student_can_access_assignment, submit_and_grade,
 )
 from core.coverage_viz import COVERAGE_COLORS, render_covered_source
+from core.course_service import get_enrollment
 from core.models import AssignmentLanguage, AssignmentType
 from core.sandbox_service import TESTKIT_H, check_test_suite_compiles
 
@@ -49,6 +52,11 @@ _ACCENT_BG = '#ddf4ff'
 def _submission_to_dict(sub) -> dict:
     return {
         'id': sub.id, 'status': sub.status.value, 'score': sub.score,
+        'test_quality_score': sub.test_quality_score,
+        'test_correctness_score': sub.test_correctness_score,
+        'assertion_quality_score': sub.assertion_quality_score,
+        'redundancy_score': sub.redundancy_score,
+        'test_diversity_score': sub.test_diversity_score,
         'tests_passed': sub.tests_passed, 'feedback': sub.feedback,
         'concept_feedback': sub.concept_feedback, 'ai_feedback': sub.ai_feedback,
         'lines_covered': sub.lines_covered, 'lines_missed': sub.lines_missed,
@@ -60,15 +68,14 @@ def _submission_to_dict(sub) -> dict:
         'uncovered_lines': sub.uncovered_lines,
         'statement_coverage_percent': sub.statement_coverage_percent,
         'function_coverage': sub.function_coverage or [],
+        'method_coverage_percent': sub.method_coverage_percent,
+        'condition_coverage_percent': sub.condition_coverage_percent,
         'assert_covered': sub.assert_covered, 'assert_total': sub.assert_total,
         'assert_coverage_percent': sub.assert_coverage_percent,
         'detected_issues': sub.detected_issues or [],
         'call_graph_data': sub.call_graph_data,
         'created_at': sub.created_at,
-        'duration_seconds': (
-            round((sub.created_at - sub.started_at).total_seconds())
-            if sub.started_at is not None else None
-        ),
+        'duration_seconds': sub.duration_seconds,
     }
 
 
@@ -85,13 +92,22 @@ def _coverage_color(pct: float | None) -> str:
 
 
 def _history_badge(d: dict) -> tuple[str, str]:
-    """(label, color) shown in the Submission History table's status cell."""
+    """(label, color) for the Coverage grade pill in Submission History."""
     if d['status'] == 'error':
         return 'Error', '#ef4444'
     if d['status'] == 'pending_review':
         return 'Pending', '#9ca3af'
     pct = d['total_coverage_percent']
-    return (f'{pct:.0f}%' if pct is not None else '—'), _coverage_color(pct)
+    return (f'Cov {pct:.0f}%' if pct is not None else 'Cov —'), _coverage_color(pct)
+
+
+def _quality_history_badge(d: dict) -> tuple[str, str] | None:
+    """(label, color) for the Test Quality grade pill — None for error/pending rows,
+    same as the coverage pill, so those just show the one status badge."""
+    if d['status'] in ('error', 'pending_review'):
+        return None
+    pct = d['test_quality_score']
+    return (f'Qual {pct:.0f}%' if pct is not None else 'Qual —'), _coverage_color(pct)
 
 
 def _grade_sync(assignment_id: int, user_id: int, code: str) -> dict:
@@ -114,7 +130,11 @@ def create_student_assignments_list_page():
 
     user_id = app.storage.user['user_id']
     with get_session() as session:
-        assignments = list_assignments(session, published_only=True, course_id=course_id, is_practice=False)
+        enrollment = get_enrollment(session, user_id)
+        assignments = list_visible_assignments_for_student(
+            session, course_id=course_id, student_id=user_id,
+            student_section=enrollment.section if enrollment else '', is_practice=False,
+        )
         if not assignments:
             ui.label('No assignments published yet.').classes('text-sm text-gray-400')
             return
@@ -122,14 +142,18 @@ def create_student_assignments_list_page():
         with ui.column().classes('w-full gap-2'):
             for a in assignments:
                 sub = latest_submission(session, a.id, user_id)
-                status = f'{sub.score:.0f}%' if sub and sub.score is not None else \
-                    ('Pending review' if sub else 'Not started')
+                if sub and sub.score is not None:
+                    status = f'Cov {sub.score:.0f}%'
+                    if sub.test_quality_score is not None:
+                        status += f' · Qual {sub.test_quality_score:.0f}%'
+                else:
+                    status = 'Pending review' if sub else 'Not started'
                 with ui.row().classes('w-full items-center gap-3 border-b border-gray-100 py-3') \
                         .style('cursor:pointer').on('click', lambda aid=a.id: ui.navigate.to(f'/student/assignments/{aid}')):
                     ui.label(a.title).classes('flex-1 text-sm font-medium')
                     ui.label(_LANGUAGE_LABELS[a.language]).classes('text-xs w-20').style(f'color:{_ACCENT}')
                     ui.label(_TYPE_LABELS[a.type]).classes('text-xs text-gray-500 w-48')
-                    ui.label(status).classes('text-sm font-semibold w-32')
+                    ui.label(status).classes('text-sm font-semibold w-44')
                     ui.button('Open →', color='primary').props('flat dense size=sm')
 
 
@@ -144,9 +168,26 @@ def create_student_assignment_detail_page(assignment_id: int):
         if a is None or not a.published or a.course_id != course_id:
             ui.label('Assignment not found.').classes('text-red-500 text-lg m-4')
             return
+        enrollment = get_enrollment(session, user_id)
+        has_access = student_can_access_assignment(
+            a, student_id=user_id, student_section=enrollment.section if enrollment else '',
+            access_student_ids=set(get_assignment_access_student_ids(session, a.id)),
+        )
+        if not has_access:
+            # Same message as "doesn't exist" — a direct link to a restricted assignment
+            # shouldn't reveal that it exists for other students, just that this student
+            # can't open it.
+            ui.label('Assignment not found.').classes('text-red-500 text-lg m-4')
+            return
         title, description, atype, alang = a.title, a.description, a.type, a.language
+        animated_feedback = a.animated_feedback
         source_code, given_test_code = a.source_code, a.given_test_code
         concept_name = a.concept.name if a.concept_id else None
+        due_at = resolve_due_at(
+            a, student_id=user_id, student_section=enrollment.section if enrollment else '',
+            overrides=list_due_date_overrides(session, a.id),
+        )
+        is_past_due = due_at is not None and datetime.now(timezone.utc) > due_at
         subs = list_submissions(session, assignment_id, student_id=user_id)  # newest first
         history = [_submission_to_dict(s) for s in subs]
         prior_code = subs[0].submitted_code if subs else ''
@@ -177,6 +218,12 @@ def create_student_assignment_detail_page(assignment_id: int):
         for badge_text in filter(None, [_TYPE_LABELS[atype], _LANGUAGE_LABELS[alang], concept_name]):
             ui.label(badge_text).classes('text-[11px] font-semibold px-2.5 py-0.5 rounded-full') \
                 .style(f'background:{_ACCENT_BG};color:{_ACCENT}')
+        if due_at is not None:
+            due_color = '#cf222e' if is_past_due else '#9a6700'
+            due_text = f"Past due — was due {due_at.strftime('%b %d, %I:%M %p')}" if is_past_due \
+                else f"Due {due_at.strftime('%b %d, %I:%M %p')}"
+            ui.label(due_text).classes('text-[11px] font-semibold px-2.5 py-0.5 rounded-full') \
+                .style(f'background:{due_color}1a;color:{due_color}')
 
     # ── Code panels — source (read-only) | test suite (editable) ──────────
     with ui.row().classes('w-full gap-0 border border-gray-200 rounded').style('height:400px'):
@@ -212,7 +259,14 @@ def create_student_assignment_detail_page(assignment_id: int):
     with ui.row().classes('w-full items-center gap-2 mt-3'):
         compile_btn = ui.button(f'Compile ({compiler_name})', icon='terminal').props('outline')
         submit_btn = ui.button('Submit for Feedback', color='primary').props('disable')
-        compile_status = ui.label("Not compiled yet — compile before submitting.").classes('text-xs text-gray-400')
+        if is_past_due:
+            compile_btn.disable()
+            compile_status = ui.label(
+                f"Past due — this was due {due_at.strftime('%b %d, %I:%M %p')}. Submissions are closed; "
+                "you can still read the source and your past submissions above."
+            ).classes('text-xs font-semibold text-red-600')
+        else:
+            compile_status = ui.label("Not compiled yet — compile before submitting.").classes('text-xs text-gray-400')
     compile_output_box = ui.column().classes('w-full gap-1 mt-1')
 
     def mark_dirty():
@@ -225,6 +279,8 @@ def create_student_assignment_detail_page(assignment_id: int):
     code_input.on_value_change(mark_dirty)
 
     async def compile_check():
+        if is_past_due:
+            return
         code = code_input.value.strip()
         if not code:
             ui.notify('Write something first.', color='warning')
@@ -273,9 +329,10 @@ def create_student_assignment_detail_page(assignment_id: int):
                 ui.label('#').classes('w-8')
                 ui.label('Submitted').classes('w-40')
                 ui.label('Tests').classes('w-20')
-                ui.label('Coverage').classes('flex-1')
+                ui.label('Grades').classes('flex-1')
             for i, d in enumerate(chronological, start=1):
                 badge_label, badge_color = _history_badge(d)
+                quality_badge = _quality_history_badge(d)
                 selected = d['id'] == state['selected_id']
                 row_style = f'background:{_ACCENT_BG}' if selected else ''
                 with ui.row().classes('w-full items-center gap-3 border-b border-gray-100 py-1.5 px-2') \
@@ -287,6 +344,10 @@ def create_student_assignment_detail_page(assignment_id: int):
                     with ui.row().classes('flex-1 items-center gap-2'):
                         ui.label(badge_label).classes('text-xs font-bold px-2 py-0.5 rounded') \
                             .style(f'background:{badge_color}22;color:{badge_color}')
+                        if quality_badge:
+                            q_label, q_color = quality_badge
+                            ui.label(q_label).classes('text-xs font-bold px-2 py-0.5 rounded') \
+                                .style(f'background:{q_color}22;color:{q_color}')
 
     def select(submission_id: int):
         state['selected_id'] = submission_id
@@ -303,7 +364,9 @@ def create_student_assignment_detail_page(assignment_id: int):
                 width = 0 if pct is None else max(0, min(100, pct))
                 ui.element('div').classes('rounded').style(f'background:{color};height:6px;width:{width}%')
 
-    def render_issues_section(issues: list[dict], submission_id: int, call_graph_data: dict | None):
+    def render_issues_section(
+        issues: list[dict], submission_id: int, call_graph_data: dict | None, animated: bool,
+    ):
         """Categorized rule-based findings (core/test_quality_service.py) — a clickable
         issue list next to an animated graph panel with three tabs:
           - CFG Playback: engine.js's playPath() steps the covered path node-by-node
@@ -363,23 +426,25 @@ def create_student_assignment_detail_page(assignment_id: int):
             elif tab == 'duchain':
                 graph_json = json.dumps(issue['graph_data'])
                 pairs = [{'def': p['def'], 'use': p['use']} for p in issue['graph_data']['metadata'].get('du_pairs', [])]
+                du_call = 'a.animateDuChain(p.def, [p.use]);' if animated else 'a.showDuChainStatic(p.def, [p.use]);'
                 body = f'''
   const a = cfgInit('{canvas_id}', {graph_json}, {{ layout: 'layered' }});
   const pairs = {json.dumps(pairs)};
-  pairs.forEach(function(p) {{ a.animateDuChain(p.def, [p.use]); }});'''
+  pairs.forEach(function(p) {{ {du_call} }});'''
             else:  # 'cfg'
                 graph_json = json.dumps(issue['graph_data'])
                 uncovered = json.dumps(issue['uncovered_node_ids'])
                 covered = json.dumps(issue['covered_node_ids'])
                 path = json.dumps(issue['covered_path'])
-                # playPath() calls reset() internally, which would wipe out an
-                # uncovered-node highlight made beforehand — so highlight AFTER
-                # starting playback, not before (playPath itself is synchronous;
-                # the actual step timers haven't fired yet at this point).
+                # Both playPath() and showPathStatic() call reset() internally, which would
+                # wipe out an uncovered-node highlight made beforehand — so highlight AFTER,
+                # not before (playPath itself is synchronous; the step timers it schedules
+                # haven't fired yet at this point — showPathStatic has no timers at all).
+                path_call = 'a.playPath(path);' if animated else 'a.showPathStatic(path);'
                 body = f'''
   const a = cfgInit('{canvas_id}', {graph_json}, {{ layout: 'layered' }});
   const path = {path};
-  if (path.length) {{ a.playPath(path); a.highlightNodes({uncovered}, 'error'); }}
+  if (path.length) {{ {path_call} a.highlightNodes({uncovered}, 'error'); }}
   else {{ a.highlightNodes({uncovered}, 'error'); a.highlightNodes({covered}, 'visited'); }}'''
             return f"cfgWhenReady('{canvas_id}', function() {{{body}\n}});"
 
@@ -472,8 +537,24 @@ if (a) {{ if (a.isPlaying) a.pause(); else a.resume(); }}
         with result_box:
             if r['status'] == 'graded':
                 color = 'text-green-600' if r['tests_passed'] else 'text-red-500'
-                note = '' if r['tests_passed'] else ' (tests failing — score is 0 until they pass)'
-                ui.label(f"Score: {r['score']:.0f}%{note}").classes(f'text-lg font-bold {color}')
+                note = '' if r['tests_passed'] else ' (tests failing — both grades are 0 until they pass)'
+                with ui.row().classes('items-center gap-6'):
+                    ui.label(f"Coverage Grade: {r['score']:.0f}%").classes(f'text-lg font-bold {color}')
+                    if r['test_quality_score'] is not None:
+                        ui.label(f"Test Quality Grade: {r['test_quality_score']:.0f}%").classes(f'text-lg font-bold {color}')
+                if note:
+                    ui.label(note.strip(' ()')).classes('text-xs text-gray-400 -mt-1')
+
+                if r['test_quality_score'] is not None:
+                    ui.label('Test Quality breakdown').classes('text-xs text-gray-500 font-semibold mt-3')
+                    with ui.grid(columns=4).classes('w-full gap-4 mt-1'):
+                        for dim_label, dim_pct in [
+                            ('Test Correctness', r['test_correctness_score']),
+                            ('Assertion Quality', r['assertion_quality_score']),
+                            ('Redundancy', r['redundancy_score']),
+                            ('Test Diversity', r['test_diversity_score']),
+                        ]:
+                            _coverage_bar(dim_label, dim_pct, f'{dim_pct:.0f}%' if dim_pct is not None else '—')
 
                 if r['line_coverage_percent'] is not None or r['branch_coverage_percent'] is not None:
                     lc, lm = r['lines_covered'] or 0, r['lines_missed'] or 0
@@ -518,7 +599,7 @@ if (a) {{ if (a.isPlaying) a.pause(); else a.resume(); }}
                     ).classes('text-[11px] text-gray-300 italic mt-1')
 
                     if r['detected_issues']:
-                        render_issues_section(r['detected_issues'], r['id'], r['call_graph_data'])
+                        render_issues_section(r['detected_issues'], r['id'], r['call_graph_data'], animated_feedback)
             elif r['status'] == 'error':
                 ui.label('Your submission timed out during grading.').classes('text-red-500 text-sm')
             else:
@@ -556,12 +637,16 @@ if (a) {{ if (a.isPlaying) a.pause(); else a.resume(); }}
         submit_btn.props('loading')
         try:
             result = await asyncio.to_thread(_grade_sync, assignment_id, user_id, code)
-            history.insert(0, result)
-            state['selected_id'] = result['id']
-            render_history()
-            render_result(result)
-            ui.notify('Graded.' if result['status'] == 'graded' else 'Submitted.', color='positive')
+        except AssignmentPastDueError as e:
+            ui.notify(f'Past due since {e.due_at.strftime("%b %d, %I:%M %p")} — submission not accepted.', color='negative')
+            submit_btn.props('disable')
+            return
         finally:
             submit_btn.props(remove='loading')
+        history.insert(0, result)
+        state['selected_id'] = result['id']
+        render_history()
+        render_result(result)
+        ui.notify('Graded.' if result['status'] == 'graded' else 'Submitted.', color='positive')
 
     submit_btn.on_click(submit)

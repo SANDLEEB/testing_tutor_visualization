@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.models import AssignmentLanguage
+from parser.cpp_cfg_builder import cpp_function_bodies
 
 _TIMEOUT_SECONDS = 15
 _CPU_SECONDS = 10
@@ -89,6 +90,16 @@ class GradeResult:
     # all don't get a gcov entry, so they simply won't appear here (documented limitation,
     # not fabricated as 0%).
     function_coverage: list[dict]
+    # Aggregate of function_coverage: what fraction of the source's own functions were
+    # invoked at least once (the standard "function coverage" metric). Python: computed
+    # against len(function_coverage) directly, since coverage.py's per-function report
+    # already lists every function whether called or not. C++: NOT computed against
+    # len(function_coverage) — gcov only emits an entry for functions that were called at
+    # least once (see function_coverage's own comment above), so that length would silently
+    # equal the covered count and always read 100%. Instead computed against the true total
+    # function count parsed straight from source_code (parser.cpp_cfg_builder.
+    # cpp_function_bodies) — see _method_coverage_percent.
+    method_coverage_percent: float | None
     # How many of the test suite's own assert statements actually executed — catches a test
     # that throws/returns before reaching some of its assertions. Measured by running
     # coverage on the test file itself too, not guessed.
@@ -170,7 +181,7 @@ def _timeout_result(seconds: int) -> GradeResult:
         lines_covered=None, lines_missed=None, line_coverage_percent=None,
         branches_covered=None, branches_missed=None, branch_coverage_percent=None,
         covered_lines=[], partial_lines=[], uncovered_lines=[],
-        statement_coverage_percent=None, function_coverage=[],
+        statement_coverage_percent=None, function_coverage=[], method_coverage_percent=None,
         assert_covered=None, assert_total=None, assert_coverage_percent=None,
         score=0.0, output=f'Execution timed out after {seconds}s.',
     )
@@ -182,10 +193,26 @@ def _no_coverage_result(*, ran: bool, tests_passed: bool, output: str) -> GradeR
         lines_covered=None, lines_missed=None, line_coverage_percent=None,
         branches_covered=None, branches_missed=None, branch_coverage_percent=None,
         covered_lines=[], partial_lines=[], uncovered_lines=[],
-        statement_coverage_percent=None, function_coverage=[],
+        statement_coverage_percent=None, function_coverage=[], method_coverage_percent=None,
         assert_covered=None, assert_total=None, assert_coverage_percent=None,
         score=0.0, output=output,
     )
+
+
+def _method_coverage_percent(
+    language: AssignmentLanguage, source_code: str, function_coverage: list[dict],
+) -> float | None:
+    """Fraction of the source's own functions invoked at least once. See
+    GradeResult.method_coverage_percent for why C++'s total can't come from
+    len(function_coverage) the way Python's can."""
+    if language == AssignmentLanguage.python:
+        total = len(function_coverage)
+    else:
+        total = len(cpp_function_bodies(source_code))
+    if not total:
+        return None
+    covered = sum(1 for fn in function_coverage if fn['lines_covered'] > 0)
+    return round(covered / total * 100, 1)
 
 
 _PY_ASSERT_LINE_RE = re.compile(r'^\s*assert\b')
@@ -308,6 +335,7 @@ def _run_python_suite(source_code: str, test_code: str, workdir: Path) -> GradeR
         branches_covered=branches_covered, branches_missed=branches_missed, branch_coverage_percent=branch_pct,
         covered_lines=covered_lines, partial_lines=partial_lines, uncovered_lines=uncovered_lines,
         statement_coverage_percent=statement_pct, function_coverage=function_coverage,
+        method_coverage_percent=_method_coverage_percent(AssignmentLanguage.python, source_code, function_coverage),
         assert_covered=assert_covered, assert_total=assert_total, assert_coverage_percent=assert_pct,
         score=0.0, output=output, test_line_coverage=test_line_coverage or None,
     )
@@ -634,6 +662,7 @@ def _run_cpp_suite(source_code: str, test_code: str, workdir: Path) -> GradeResu
         branches_covered=branches_covered, branches_missed=branches_missed, branch_coverage_percent=branch_pct,
         covered_lines=covered_lines, partial_lines=partial_lines, uncovered_lines=uncovered_lines,
         statement_coverage_percent=statement_pct, function_coverage=function_coverage,
+        method_coverage_percent=_method_coverage_percent(AssignmentLanguage.cpp, source_code, function_coverage),
         assert_covered=assert_covered, assert_total=assert_total, assert_coverage_percent=assert_pct,
         score=0.0, output=output,
     )

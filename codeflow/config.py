@@ -7,7 +7,21 @@ load_dotenv()
 DATABASE_URL = os.environ.get(
     'DATABASE_URL', 'postgresql+psycopg://codeflow:codeflow@localhost:5433/codeflow'
 )
+# Managed Postgres providers (Render included) hand back a bare `postgres://` or
+# `postgresql://` URL. SQLAlchemy needs the `+psycopg` driver suffix to use psycopg3
+# (the only postgres driver in requirements.txt — psycopg2 isn't installed), so
+# normalize whatever scheme we're given instead of failing at create_engine().
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = 'postgresql+psycopg://' + DATABASE_URL[len('postgres://'):]
+elif DATABASE_URL.startswith('postgresql://'):
+    DATABASE_URL = 'postgresql+psycopg://' + DATABASE_URL[len('postgresql://'):]
 SESSION_SECRET = os.environ.get('SESSION_SECRET', 'codeflow-secret-2024')
+
+# Key for the one-way HMAC-SHA256 tokens that pseudonymize student/submission ids in
+# AssignmentSubmission (see core/anonymize.py) — irreversible, so change it only if you
+# intend to invalidate every existing token (anything hashed under the old key becomes
+# unrecomputable — see auth/db.py's backfill for what re-running it does in that case).
+SUBMISSION_HASH_SECRET = os.environ.get('SUBMISSION_HASH_SECRET', 'codeflow-submission-hash-secret-2024')
 
 ADMIN_EMAILS = {
     email.strip().lower()

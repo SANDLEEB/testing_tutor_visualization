@@ -95,3 +95,41 @@ def list_students(session: Session, course_id: int) -> list[User]:
         .order_by(User.full_name)
     )
     return list(session.scalars(stmt))
+
+
+def student_picker_label(user: User) -> str:
+    """'Full Name (email) — CWID: 12345' (CWID segment omitted if unset) — used
+    everywhere an instructor picks specific students by name/email/CWID
+    (pages/access_fields.AccessFields' type-to-filter student select)."""
+    label = f'{user.full_name} ({user.email})'
+    return f'{label} — CWID: {user.cwid}' if user.cwid else label
+
+
+def list_sections(session: Session, course_id: int) -> list[str]:
+    """Distinct non-empty section labels currently in use among this course's students,
+    sorted — empty when nobody's been assigned one yet (the common single-section case),
+    which is also the signal pages/instructor_students_page.py uses to hide the section
+    filter entirely rather than show a pointless one-option dropdown."""
+    stmt = (
+        select(Enrollment.section)
+        .where(
+            Enrollment.course_id == course_id, Enrollment.role == EnrollmentRole.student,
+            Enrollment.section != '',
+        )
+        .distinct()
+        .order_by(Enrollment.section)
+    )
+    return list(session.scalars(stmt))
+
+
+def set_student_section(session: Session, *, student_id: int, course_id: int, section: str) -> bool:
+    """Assign/clear a student's section label. Scoped to course_id so an instructor can't
+    edit a student's enrollment in a course they don't own. Returns False if there's no
+    such enrollment (student not in this course)."""
+    enrollment = session.scalar(
+        select(Enrollment).where(Enrollment.user_id == student_id, Enrollment.course_id == course_id)
+    )
+    if enrollment is None:
+        return False
+    enrollment.section = section.strip()
+    return True

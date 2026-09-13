@@ -27,6 +27,7 @@ None — they're still visible on the Call Graph tab, which is issue-independent
 import ast
 import re
 import textwrap
+from dataclasses import dataclass
 
 from core.models import AssignmentLanguage
 from core.sandbox_service import GradeResult, get_cpp_per_test_coverage
@@ -107,6 +108,66 @@ def analyze_test_quality(
     for i, issue in enumerate(issues, start=1):
         issue['id'] = i
     return issues
+
+
+# The Test Quality grade's 4 named dimensions — each of the 7 detector categories
+# above falls under exactly one. A dimension's score is the unweighted % of its own
+# member categories that triggered no issue; the overall grade is then the
+# unweighted average of these 4 dimension scores (not of the 7 categories directly),
+# so e.g. Assertion Quality's single detector carries the same 25% weight as Test
+# Correctness's three — otherwise the 3-detector dimension would quietly dominate.
+_DIMENSIONS = {
+    # Does the suite actually verify the behavior it's supposed to — every function
+    # called, every branch taken, every exception path triggered?
+    'test_correctness': ('happy_path_bias', 'lack_of_partitioning', 'insufficient_method_coverage'),
+    # Do the tests assert anything at all about the outcome?
+    'assertion_quality': ('assertion_misuse',),
+    # Do distinct-looking tests actually add distinct fault-detection value?
+    'redundancy': ('superficial_modifications',),
+    # Does the suite range across different kinds of input — boundary values, not
+    # just typical ones; ordinary results, not just exceptions?
+    'test_diversity': ('overfocus_valid_inputs', 'over_reliance_exception_testing'),
+}
+
+_CATEGORY_KEY_BY_LABEL = {v['category']: k for k, v in _CATEGORIES.items()}
+
+
+@dataclass
+class TestQualityBreakdown:
+    test_correctness: float
+    assertion_quality: float
+    redundancy: float
+    test_diversity: float
+    overall: float
+
+    @classmethod
+    def zero(cls) -> 'TestQualityBreakdown':
+        """All 4 dimensions (and overall) at 0 — the same 0-if-tests-are-failing
+        convention core/sandbox_service.GradeResult.score already applies to the
+        Coverage grade, applied here too rather than reporting real dimension scores
+        for a suite that doesn't even pass."""
+        return cls(test_correctness=0.0, assertion_quality=0.0, redundancy=0.0, test_diversity=0.0, overall=0.0)
+
+
+def compute_test_quality_breakdown(issues: list[dict]) -> TestQualityBreakdown:
+    """The Test Quality grade, broken into the 4 named dimensions above, plus an
+    `overall` (their unweighted average — see _DIMENSIONS' comment for why not a
+    straight per-category average).
+
+    Call with analyze_test_quality's own return value — but only the issues from
+    that call, before core/assignment_service.submit_and_grade appends any
+    Instructor Comparison issues (build_comparison_issue) on top. Those depend on
+    feedback_mode and a reference suite even existing, so folding them in would make
+    which categories exist (and thus each dimension's meaning) vary assignment to
+    assignment.
+    """
+    fired = {_CATEGORY_KEY_BY_LABEL[i['category']] for i in issues if i['category'] in _CATEGORY_KEY_BY_LABEL}
+    scores = {
+        dimension: round((len(keys) - sum(1 for k in keys if k in fired)) / len(keys) * 100, 1)
+        for dimension, keys in _DIMENSIONS.items()
+    }
+    overall = round(sum(scores.values()) / len(scores), 1)
+    return TestQualityBreakdown(**scores, overall=overall)
 
 
 # ─── Shared helpers ───────────────────────────────────────────────────────────

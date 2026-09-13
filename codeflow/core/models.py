@@ -22,6 +22,18 @@ class EnrollmentRole(str, enum.Enum):
     student = 'student'
 
 
+class AccessScope(str, enum.Enum):
+    """Who can see a published Assignment or Question, beyond course membership —
+    set per-row by whoever authored it (pages/instructor_assignments_page.py,
+    pages/instructor_practice_page.py). `course` is the default and matches every
+    prior behavior (anyone enrolled in the course), so nothing already published
+    narrows automatically when this column appears.
+    """
+    course = 'course'      # everyone enrolled in the course — the original, only, behavior
+    sections = 'sections'  # only students whose Enrollment.section is in access_sections
+    students = 'students'  # only the specific students in the *_access_students join table
+
+
 class Course(Base):
     __tablename__ = 'courses'
 
@@ -50,6 +62,13 @@ class Enrollment(Base):
     role: Mapped[EnrollmentRole] = mapped_column(
         Enum(EnrollmentRole), nullable=False, default=EnrollmentRole.student
     )
+    # Free-text label (e.g. '01', 'A', 'TR 10am') an instructor assigns per student from
+    # the roster page (pages/instructor_students_page.py) — '' means unsectioned. A Course
+    # doesn't otherwise model sections at all; this is the only place the concept exists,
+    # by design, since one instructor account already owns exactly one Course (see
+    # core/course_service.py's module docstring) and "multiple sections" in practice means
+    # one roster split into sub-groups, not multiple Course rows.
+    section: Mapped[str] = mapped_column(String, nullable=False, default='')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     course: Mapped['Course'] = relationship(back_populates='enrollments')
@@ -175,12 +194,28 @@ class Question(Base):
     graph_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     difficulty: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # See AccessScope. access_sections is only meaningful when access_scope is 'sections' —
+    # a JSON list of section labels (Enrollment.section values); which specific students
+    # when access_scope is 'students' lives in QuestionAccessStudent instead, not here.
+    access_scope: Mapped[AccessScope] = mapped_column(Enum(AccessScope), nullable=False, default=AccessScope.course)
+    access_sections: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     content_item: Mapped['ContentItem | None'] = relationship()
     material: Mapped['CourseMaterial | None'] = relationship()
     concept: Mapped['Concept | None'] = relationship()
+
+
+class QuestionAccessStudent(Base):
+    """One row per (question, student) granted access when Question.access_scope is
+    'students' — core/question_service.set_question_access manages these."""
+    __tablename__ = 'question_access_students'
+    __table_args__ = (UniqueConstraint('question_id', 'student_id', name='uq_question_access_student'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey('questions.id'), nullable=False)
+    student_id: Mapped[int] = mapped_column(ForeignKey('users.id'), nullable=False)
 
 
 class QuestionAttempt(Base):
@@ -254,7 +289,26 @@ class Assignment(Base):
     feedback_mode: Mapped[FeedbackMode] = mapped_column(
         Enum(FeedbackMode), nullable=False, default=FeedbackMode.test_cases
     )
+    # Instructor-controlled, per-assignment: the Detected Issues panel's CFG Playback and
+    # Def-Use Chains tabs either step through the graph (particle travel, node-by-node) or
+    # jump straight to the same end state instantly. Call Graph tab is unaffected — it was
+    # already static. See core/models.FeedbackMode for the analogous test_cases/ai toggle.
+    animated_feedback: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # See AccessScope. access_sections is only meaningful when access_scope is 'sections' —
+    # a JSON list of section labels (Enrollment.section values); which specific students
+    # when access_scope is 'students' lives in AssignmentAccessStudent instead, not here.
+    access_scope: Mapped[AccessScope] = mapped_column(Enum(AccessScope), nullable=False, default=AccessScope.course)
+    access_sections: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Deadline — None means no deadline. Blocks new submissions once passed
+    # (core/assignment_service.submit_and_grade), it does NOT hide the assignment from
+    # view (a student can still read it and see past submissions after the deadline,
+    # they just can't submit a new one) — separate from AccessScope, which controls
+    # visibility, not submittability. due_at is the default for everyone; a row in
+    # AssignmentDueDateOverride for a student's own id, or failing that their section,
+    # takes precedence over this (core/assignment_service.resolve_due_at) — the same
+    # "most specific wins" resolution AccessScope would use if it had comparable levels.
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_id: Mapped[int] = mapped_column(ForeignKey('users.id'), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -262,6 +316,33 @@ class Assignment(Base):
     )
 
     concept: Mapped['Concept | None'] = relationship()
+
+
+class AssignmentAccessStudent(Base):
+    """One row per (assignment, student) granted access when Assignment.access_scope is
+    'students' — core/assignment_service.set_assignment_access manages these."""
+    __tablename__ = 'assignment_access_students'
+    __table_args__ = (UniqueConstraint('assignment_id', 'student_id', name='uq_assignment_access_student'),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey('assignments.id'), nullable=False)
+    student_id: Mapped[int] = mapped_column(ForeignKey('users.id'), nullable=False)
+
+
+class AssignmentDueDateOverride(Base):
+    """A different deadline than Assignment.due_at for one section or one student —
+    core/assignment_service.set_due_date_overrides manages these. Exactly one of
+    section/student_id is set per row (enforced in the service layer, not a DB
+    constraint): a student-id row beats a section row beats the assignment's own
+    due_at, for that student — see resolve_due_at.
+    """
+    __tablename__ = 'assignment_due_date_overrides'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey('assignments.id'), nullable=False)
+    section: Mapped[str | None] = mapped_column(String, nullable=True)
+    student_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AssignmentAttemptStart(Base):
@@ -292,26 +373,57 @@ class AssignmentSubmission(Base):
     Coverage fields mirror standard line/branch coverage-report terminology
     (LinesCovered/Missed, BranchesCovered/Missed, plus the percentages and the
     combined Total* rollups) so a submission can be read the same way a JUnit/
-    gcov/coverage.py report would be. There's no separate condition-level
-    (MC/DC) field: neither coverage.py nor gcov measure per-boolean-sub-expression
-    coverage out of the box, and reporting a number under that name without
-    actually measuring it would be misleading — branch coverage is the closest
-    real signal available for now.
+    gcov/coverage.py report would be. condition_coverage_percent has no computation
+    behind it yet and is always None: neither coverage.py nor gcov measure per-
+    boolean-sub-expression (MC/DC) coverage out of the box, and reporting a number
+    under that name without actually measuring it would be misleading — the column
+    exists so the schema has a home for it once real instrumentation is built;
+    branch coverage is the closest real signal available today.
+    method_coverage_percent is real (core/sandbox_service._method_coverage_percent):
+    the fraction of the source's own functions invoked at least once.
 
-    started_at/created_at give SubmissionTime as a duration (see
-    AssignmentAttemptStart for how started_at is captured). concept_feedback is
-    generated internally (core/assignment_service.generate_comparison_feedback) by
-    diffing the student's coverage against the instructor's own reference test suite
-    — no LLM involved — distinct from `feedback` (raw pytest/gcov output).
+    started_at/created_at bound the attempt (see AssignmentAttemptStart for how
+    started_at is captured); duration_seconds is that span computed once at submit
+    time (core/assignment_service.submit_and_grade), rather than recomputed from the
+    two timestamps by every reader. concept_feedback is generated internally
+    (core/assignment_service.generate_comparison_feedback) by diffing the student's
+    coverage against the instructor's own reference test suite — no LLM involved —
+    distinct from `feedback` (raw pytest/gcov output).
+
+    student_token/submission_token (core/anonymize.py) are one-way HMAC-SHA256
+    pseudonyms — student_token is stable per student (same value across all their
+    submissions, for linking without exposing student_id); submission_token is
+    unique per row. Neither is reversible back to the underlying id.
     """
     __tablename__ = 'assignment_submissions'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     assignment_id: Mapped[int] = mapped_column(ForeignKey('assignments.id'), nullable=False)
     student_id: Mapped[int] = mapped_column(ForeignKey('users.id'), nullable=False)
+    student_token: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # Nullable at the DB level only because it's hashed from this row's own id, which
+    # doesn't exist until after the first flush — core/assignment_service.submit_and_grade
+    # always sets it immediately after that flush, before the transaction commits, so in
+    # practice it's never left null for a real submission.
+    submission_token: Mapped[str | None] = mapped_column(String, nullable=True, unique=True, index=True)
     submitted_code: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[SubmissionStatus] = mapped_column(Enum(SubmissionStatus), nullable=False)
+    # The two grades a write_tests submission gets — evaluate_tests submissions (pending_review,
+    # graded manually) leave all of these None. `score` is the Coverage grade: blended
+    # line+branch coverage, 0 if tests_passed is False. test_quality_score is the second
+    # grade — same 0-if-failing convention — the unweighted average of the 4 dimension
+    # scores right below it (core/test_quality_service.TestQualityBreakdown.overall).
     score: Mapped[float | None] = mapped_column(nullable=True)
+    test_quality_score: Mapped[float | None] = mapped_column(nullable=True)
+    # Test Quality's breakdown — each dimension is itself an unweighted % of however many
+    # of the 7 rule-based heuristics (Assertion Misuse, Happy Path Bias, etc.) fall under
+    # it that triggered no issue; see core/test_quality_service._DIMENSIONS for exactly
+    # which categories feed which dimension. Computed once at submit time
+    # (core/assignment_service.submit_and_grade), not recomputed on each view.
+    test_correctness_score: Mapped[float | None] = mapped_column(nullable=True)
+    assertion_quality_score: Mapped[float | None] = mapped_column(nullable=True)
+    redundancy_score: Mapped[float | None] = mapped_column(nullable=True)
+    test_diversity_score: Mapped[float | None] = mapped_column(nullable=True)
     tests_passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     feedback: Mapped[str] = mapped_column(Text, nullable=False, default='')
     concept_feedback: Mapped[str] = mapped_column(Text, nullable=False, default='')
@@ -332,6 +444,10 @@ class AssignmentSubmission(Base):
     # computed, and GradeResult's docstring for what's real vs. a documented limitation.
     statement_coverage_percent: Mapped[float | None] = mapped_column(nullable=True)
     function_coverage: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Aggregate of function_coverage above: covered functions / total functions * 100.
+    method_coverage_percent: Mapped[float | None] = mapped_column(nullable=True)
+    # Not measured — see class docstring. Always None until real MC/DC instrumentation exists.
+    condition_coverage_percent: Mapped[float | None] = mapped_column(nullable=True)
     assert_covered: Mapped[int | None] = mapped_column(Integer, nullable=True)
     assert_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     assert_coverage_percent: Mapped[float | None] = mapped_column(nullable=True)
@@ -356,6 +472,9 @@ class AssignmentSubmission(Base):
 
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # (created_at - started_at) in whole seconds, computed once at submit time — None
+    # when started_at wasn't captured (e.g. a pre-existing row from before this existed).
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     assignment: Mapped['Assignment'] = relationship()
     student: Mapped['User'] = relationship()

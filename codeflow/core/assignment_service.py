@@ -4,19 +4,24 @@ AssignmentSubmission, plus grading orchestration via core/sandbox_service.
 import asyncio
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 import config
 from core import settings_service
 from core.ai_service import AIServiceError, generate_assignment_feedback
+from core.anonymize import hash_student_id, hash_submission_id
 from core.bkt_service import record_attempt_and_update
+from core.course_service import get_enrollment
 from core.models import (
-    Assignment, AssignmentAttemptStart, AssignmentLanguage, AssignmentSubmission,
-    AssignmentType, FeedbackMode, SubmissionStatus,
+    AccessScope, Assignment, AssignmentAccessStudent, AssignmentAttemptStart, AssignmentDueDateOverride,
+    AssignmentLanguage, AssignmentSubmission, AssignmentType, FeedbackMode, SubmissionStatus,
 )
 from core.sandbox_service import GradeResult, run_test_suite
-from core.test_quality_service import analyze_test_quality, build_call_graph_view, build_comparison_issue
+from core.test_quality_service import (
+    TestQualityBreakdown, analyze_test_quality, build_call_graph_view, build_comparison_issue,
+    compute_test_quality_breakdown,
+)
 
 # Coverage bar a submission has to clear (on top of its tests actually passing) to
 # count as "demonstrates understanding" for BKT mastery purposes. Distinct from
@@ -77,12 +82,13 @@ def create_assignment(
     session: Session, *, title: str, description: str, type: AssignmentType,
     language: AssignmentLanguage, source_code: str, given_test_code: str | None, created_by_id: int,
     course_id: int, concept_id: int | None = None, is_practice: bool = False, hint: str = '',
-    feedback_mode: FeedbackMode = FeedbackMode.test_cases,
+    feedback_mode: FeedbackMode = FeedbackMode.test_cases, animated_feedback: bool = True,
 ) -> Assignment:
     assignment = Assignment(
         title=title, description=description, type=type, language=language, source_code=source_code,
         given_test_code=given_test_code, created_by_id=created_by_id, course_id=course_id,
         concept_id=concept_id, is_practice=is_practice, hint=hint, feedback_mode=feedback_mode,
+        animated_feedback=animated_feedback,
     )
     session.add(assignment)
     session.flush()
@@ -91,10 +97,13 @@ def create_assignment(
 
 def update_assignment(
     session: Session, assignment: Assignment, *, title: str, description: str,
+    type: AssignmentType, language: AssignmentLanguage,
     source_code: str, given_test_code: str | None, hint: str = '',
 ) -> Assignment:
     assignment.title = title
     assignment.description = description
+    assignment.type = type
+    assignment.language = language
     assignment.source_code = source_code
     assignment.given_test_code = given_test_code
     assignment.hint = hint
@@ -103,6 +112,10 @@ def update_assignment(
 
 def set_feedback_mode(session: Session, assignment: Assignment, mode: FeedbackMode) -> None:
     assignment.feedback_mode = mode
+
+
+def set_animated_feedback(session: Session, assignment: Assignment, enabled: bool) -> None:
+    assignment.animated_feedback = enabled
 
 
 def list_assignments(
@@ -130,7 +143,126 @@ def set_published(session: Session, assignment: Assignment, published: bool) -> 
     assignment.published = published
 
 
+def get_assignment_access_student_ids(session: Session, assignment_id: int) -> list[int]:
+    return list(session.scalars(
+        select(AssignmentAccessStudent.student_id).where(AssignmentAccessStudent.assignment_id == assignment_id)
+    ))
+
+
+def set_assignment_access(
+    session: Session, assignment: Assignment, *, scope: AccessScope,
+    sections: list[str] | None = None, student_ids: list[int] | None = None,
+) -> None:
+    """Who beyond course membership can see this assignment — 'course' (the default,
+    everyone enrolled), 'sections' (only Enrollment.section in `sections`), or
+    'students' (only the given student_ids, synced into AssignmentAccessStudent).
+    sections/student_ids for the scope(s) NOT chosen are cleared, not just ignored,
+    so switching scope doesn't leave stale grants behind."""
+    assignment.access_scope = scope
+    assignment.access_sections = sorted(set(sections)) if scope == AccessScope.sections and sections else []
+    session.execute(delete(AssignmentAccessStudent).where(AssignmentAccessStudent.assignment_id == assignment.id))
+    if scope == AccessScope.students:
+        for student_id in set(student_ids or []):
+            session.add(AssignmentAccessStudent(assignment_id=assignment.id, student_id=student_id))
+
+
+def student_can_access_assignment(
+    assignment: Assignment, *, student_id: int, student_section: str, access_student_ids: set[int] = frozenset(),
+) -> bool:
+    """Pure check, no query — access_student_ids only matters when access_scope is
+    'students' (pass get_assignment_access_student_ids's result, or a batch-fetched set)."""
+    if assignment.access_scope == AccessScope.course:
+        return True
+    if assignment.access_scope == AccessScope.sections:
+        return student_section in (assignment.access_sections or [])
+    return student_id in access_student_ids
+
+
+def list_visible_assignments_for_student(
+    session: Session, *, course_id: int, student_id: int, student_section: str, is_practice: bool | None = None,
+) -> list[Assignment]:
+    """Published assignments in course_id this specific student can actually see —
+    list_assignments(published_only=True) plus access_scope. Every student-facing
+    surface (graded-assignments list, adaptive practice) filters through here, not
+    list_assignments directly, so a per-student/per-section restriction an
+    instructor sets actually holds everywhere a student could otherwise reach it."""
+    assignments = list_assignments(session, course_id=course_id, published_only=True, is_practice=is_practice)
+    student_scoped_ids = [a.id for a in assignments if a.access_scope == AccessScope.students]
+    # Assignment ids (not student ids!) this student has a grant for — batch-fetched
+    # once rather than one get_assignment_access_student_ids query per assignment.
+    granted_assignment_ids = set()
+    if student_scoped_ids:
+        granted_assignment_ids = set(session.scalars(
+            select(AssignmentAccessStudent.assignment_id).where(
+                AssignmentAccessStudent.student_id == student_id,
+                AssignmentAccessStudent.assignment_id.in_(student_scoped_ids),
+            )
+        ))
+    return [
+        a for a in assignments
+        if a.access_scope == AccessScope.course
+        or (a.access_scope == AccessScope.sections and student_section in (a.access_sections or []))
+        or (a.access_scope == AccessScope.students and a.id in granted_assignment_ids)
+    ]
+
+
+def set_assignment_due_date(session: Session, assignment: Assignment, due_at: datetime | None) -> None:
+    assignment.due_at = due_at
+
+
+def list_due_date_overrides(session: Session, assignment_id: int) -> list[AssignmentDueDateOverride]:
+    return list(session.scalars(
+        select(AssignmentDueDateOverride).where(AssignmentDueDateOverride.assignment_id == assignment_id)
+    ))
+
+
+def set_due_date_overrides(session: Session, assignment: Assignment, overrides: list[dict]) -> None:
+    """Replaces every existing override for this assignment with `overrides` — each a
+    {'section': str} or {'student_id': int} dict plus 'due_at' (a timezone-aware
+    datetime). Whole-class default deadline is Assignment.due_at
+    (set_assignment_due_date), not here."""
+    session.execute(
+        delete(AssignmentDueDateOverride).where(AssignmentDueDateOverride.assignment_id == assignment.id)
+    )
+    for o in overrides:
+        session.add(AssignmentDueDateOverride(
+            assignment_id=assignment.id, section=o.get('section'), student_id=o.get('student_id'),
+            due_at=o['due_at'],
+        ))
+
+
+def resolve_due_at(
+    assignment: Assignment, *, student_id: int, student_section: str,
+    overrides: list[AssignmentDueDateOverride] = (),
+) -> datetime | None:
+    """The deadline that actually applies to this student — a per-student override
+    beats a per-section override beats the assignment's own due_at (None = no
+    deadline). Pass list_due_date_overrides's result, or a pre-fetched list for a
+    batch of students."""
+    student_override = next((o for o in overrides if o.student_id == student_id), None)
+    if student_override is not None:
+        return student_override.due_at
+    if student_section:
+        section_override = next((o for o in overrides if o.section == student_section), None)
+        if section_override is not None:
+            return section_override.due_at
+    return assignment.due_at
+
+
+class AssignmentPastDueError(Exception):
+    """Raised by submit_and_grade when this student's resolved deadline has already
+    passed — the assignment stays visible/readable, this just blocks a new final
+    submission from being graded."""
+    def __init__(self, due_at: datetime):
+        self.due_at = due_at
+        super().__init__(f'Past due — the deadline for this assignment was {due_at.isoformat()}.')
+
+
 def delete_assignment(session: Session, assignment: Assignment) -> None:
+    session.execute(delete(AssignmentAccessStudent).where(AssignmentAccessStudent.assignment_id == assignment.id))
+    session.execute(
+        delete(AssignmentDueDateOverride).where(AssignmentDueDateOverride.assignment_id == assignment.id)
+    )
     session.delete(assignment)
 
 
@@ -184,7 +316,19 @@ def submit_and_grade(
     """Grade write_tests submissions immediately in the sandbox (also updating the
     assignment's tagged-concept BKT mastery); queue evaluate_tests submissions for
     instructor review (not yet auto-graded).
+
+    Raises AssignmentPastDueError before doing any grading work if this student's
+    resolved deadline (resolve_due_at) has already passed — checked here, not just in
+    the UI, so a late submission can't slip through by calling this directly.
     """
+    enrollment = get_enrollment(session, student_id)
+    due_at = resolve_due_at(
+        assignment, student_id=student_id, student_section=enrollment.section if enrollment else '',
+        overrides=list_due_date_overrides(session, assignment.id),
+    )
+    if due_at is not None and datetime.now(timezone.utc) > due_at:
+        raise AssignmentPastDueError(due_at)
+
     start_row = session.scalar(
         select(AssignmentAttemptStart).where(
             AssignmentAttemptStart.assignment_id == assignment.id,
@@ -192,6 +336,9 @@ def submit_and_grade(
         )
     )
     started_at = start_row.started_at if start_row else None
+    submitted_at = datetime.now(timezone.utc)
+    duration_seconds = round((submitted_at - started_at).total_seconds()) if started_at is not None else None
+    student_token = hash_student_id(student_id)
 
     if assignment.type == AssignmentType.write_tests:
         result = run_test_suite(assignment.language, assignment.source_code, submitted_code)
@@ -221,10 +368,18 @@ def submit_and_grade(
 
         detected_issues = []
         call_graph_data = None
+        quality: TestQualityBreakdown | None = None
         if not result.timed_out and result.line_coverage_percent is not None:
             detected_issues = analyze_test_quality(
                 language=assignment.language, source_code=assignment.source_code,
                 test_code=submitted_code, result=result,
+            )
+            # Same 0-if-failing convention as result.score (the Coverage grade) — computed
+            # from detected_issues as they stand right now, before Instructor Comparison
+            # issues get appended below (see compute_test_quality_breakdown's docstring).
+            quality = (
+                compute_test_quality_breakdown(detected_issues) if result.tests_passed
+                else TestQualityBreakdown.zero()
             )
             call_graph_data = build_call_graph_view(
                 language=assignment.language, source_code=assignment.source_code, result=result,
@@ -261,9 +416,16 @@ def submit_and_grade(
                 issue['id'] = i
 
         submission = AssignmentSubmission(
-            assignment_id=assignment.id, student_id=student_id, submitted_code=submitted_code,
+            assignment_id=assignment.id, student_id=student_id, student_token=student_token,
+            submitted_code=submitted_code,
             status=SubmissionStatus.error if result.timed_out else SubmissionStatus.graded,
-            score=result.score, tests_passed=result.tests_passed, feedback=result.output,
+            score=result.score,
+            test_quality_score=quality.overall if quality else None,
+            test_correctness_score=quality.test_correctness if quality else None,
+            assertion_quality_score=quality.assertion_quality if quality else None,
+            redundancy_score=quality.redundancy if quality else None,
+            test_diversity_score=quality.test_diversity if quality else None,
+            tests_passed=result.tests_passed, feedback=result.output,
             concept_feedback=concept_feedback, ai_feedback=ai_feedback,
             lines_covered=result.lines_covered, lines_missed=result.lines_missed,
             branches_covered=result.branches_covered, branches_missed=result.branches_missed,
@@ -274,14 +436,16 @@ def submit_and_grade(
             uncovered_lines=result.uncovered_lines,
             statement_coverage_percent=result.statement_coverage_percent,
             function_coverage=result.function_coverage,
+            method_coverage_percent=result.method_coverage_percent,
             assert_covered=result.assert_covered, assert_total=result.assert_total,
             assert_coverage_percent=result.assert_coverage_percent,
             detected_issues=detected_issues,
             call_graph_data=call_graph_data,
-            started_at=started_at,
+            started_at=started_at, created_at=submitted_at, duration_seconds=duration_seconds,
         )
         session.add(submission)
         session.flush()
+        submission.submission_token = hash_submission_id(submission.id)
 
         if not result.timed_out and assignment.concept_id is not None:
             demonstrated = bool(
@@ -293,13 +457,15 @@ def submit_and_grade(
             )
     else:
         submission = AssignmentSubmission(
-            assignment_id=assignment.id, student_id=student_id, submitted_code=submitted_code,
+            assignment_id=assignment.id, student_id=student_id, student_token=student_token,
+            submitted_code=submitted_code,
             status=SubmissionStatus.pending_review, score=None, tests_passed=None,
             feedback='Submitted — evaluate_tests assignments are graded manually by your instructor for now.',
-            started_at=started_at,
+            started_at=started_at, created_at=submitted_at, duration_seconds=duration_seconds,
         )
         session.add(submission)
         session.flush()
+        submission.submission_token = hash_submission_id(submission.id)
 
     return submission
 

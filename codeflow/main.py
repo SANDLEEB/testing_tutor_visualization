@@ -16,6 +16,8 @@ from pages.login_page    import create_login_page
 from pages.admin_page    import create_admin_page
 from pages.instructor_assignments_page import create_instructor_assignments_page
 from pages.instructor_practice_page import create_instructor_practice_page
+from pages.instructor_student_detail_page import create_instructor_student_detail_page
+from pages.instructor_students_page import create_instructor_students_page
 from pages.instructor_topics_page import create_instructor_topics_page
 from pages.student_adaptive_practice_page import create_adaptive_practice_page
 from pages.student_assignments_page import (
@@ -29,8 +31,10 @@ from pages.student_topics_page import create_student_topics_page
 # Assignments (instructor + student), Practice Questions (instructor +
 # student adaptive), Topics (instructor + student mastery dashboards — no
 # detail-page drill-down; pages/topic_hub_page.py's content-library view is
-# unwired on purpose, see instructor_topics_page.py's docstring), and the
-# shared login/logout/admin scaffolding are live so far.
+# unwired on purpose, see instructor_topics_page.py's docstring), Students
+# (instructor roster + per-student detail, optionally section-filtered — see
+# pages/instructor_students_page.py), and the shared login/logout/admin
+# scaffolding are live so far.
 
 app.on_startup(init_db)
 auth_routes.register(app)
@@ -142,6 +146,7 @@ INSTRUCTOR_NAV = [
         ('📚', 'Topics',             '/instructor/topics'),
     ]),
     ('', [
+        ('👥', 'Students',          '/instructor/students'),
         ('⌂', 'Home',               '/instructor/home'),
     ]),
 ]
@@ -355,6 +360,20 @@ def instructor_topics():
     create_layout('/instructor/topics', create_instructor_topics_page, roles=('faculty', 'admin'))
 
 
+@ui.page('/instructor/students')
+def instructor_students():
+    create_layout('/instructor/students', create_instructor_students_page, roles=('faculty', 'admin'))
+
+
+@ui.page('/instructor/students/{student_id}')
+def instructor_student_detail(student_id: int):
+    create_layout(
+        '/instructor/students',
+        lambda: create_instructor_student_detail_page(student_id),
+        roles=('faculty', 'admin'),
+    )
+
+
 # ── Admin ────────────────────────────────────────────────────────────────────
 
 @ui.page('/admin/users')
@@ -382,9 +401,11 @@ def logout():
 
 if __name__ in {'__main__', '__mp_main__'}:
     ui.run(
-        port=8080,
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 8080)),  # Render assigns PORT dynamically
         title='Testing Tutor',
         favicon='🔬',
         storage_secret=config.SESSION_SECRET,
         show=False,
+        reload=False,
     )

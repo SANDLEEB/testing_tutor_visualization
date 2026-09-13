@@ -21,7 +21,7 @@ def get_user_by_id(session: Session, user_id: int) -> User | None:
 
 
 def create_password_user(
-    session: Session, email: str, password: str, full_name: str, role: Role = Role.student,
+    session: Session, email: str, password: str, full_name: str, role: Role = Role.student, cwid: str = '',
 ) -> User:
     user = User(
         email=email.lower(),
@@ -29,6 +29,7 @@ def create_password_user(
         hashed_password=hash_password(password),
         auth_provider=AuthProvider.password,
         role=_role_for_new_account(email, role),
+        cwid=cwid.strip(),
     )
     session.add(user)
     session.flush()
@@ -76,3 +77,9 @@ def set_active(session: Session, user_id: int, is_active: bool) -> None:
     user = session.get(User, user_id)
     if user:
         user.is_active = is_active
+
+
+def set_cwid(session: Session, user_id: int, cwid: str) -> None:
+    user = session.get(User, user_id)
+    if user:
+        user.cwid = cwid.strip()
