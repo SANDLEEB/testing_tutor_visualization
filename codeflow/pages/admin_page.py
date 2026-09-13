@@ -1,12 +1,12 @@
 """Admin-only user management page."""
-from nicegui import ui
+from nicegui import app, ui
 
 import config
 from auth.db import get_session
 from auth.models import Role
 from auth.service import list_users, set_active, set_role
 from core import settings_service
-from core.course_service import set_enrollment_role
+from core.course_service import create_course, list_courses, list_institutions, set_enrollment_role
 from core.models import EnrollmentRole
 
 ROLE_OPTIONS = [r.value for r in Role]
@@ -39,6 +39,51 @@ def create_admin_page():
                 "Master switch — when off, no assignment produces AI feedback regardless of "
                 "its own per-assignment feedback setting."
             ).classes('text-xs text-gray-400')
+
+    with ui.card().classes('w-full p-4 gap-2 mb-4'):
+        ui.label('Institutions & Courses').classes('font-semibold text-sm text-gray-500 uppercase tracking-wide')
+        ui.label(
+            'Signup and "add student manually" both only offer institutions/courses created '
+            'here — create one before anyone can join it.'
+        ).classes('text-xs text-gray-400')
+
+        course_list = ui.column().classes('w-full gap-1 my-2')
+
+        def refresh_courses():
+            course_list.clear()
+            with course_list, get_session() as session:
+                courses = list_courses(session)
+                if not courses:
+                    ui.label('No courses yet.').classes('text-sm text-gray-400')
+                for c in courses:
+                    ui.label(f'{c.institution} — {c.title}  ({c.code})').classes('text-sm')
+
+        refresh_courses()
+
+        with get_session() as session:
+            institutions = list_institutions(session)
+
+        with ui.row().classes('w-full items-end gap-2'):
+            institution_input = ui.input(label='Institution', autocomplete=institutions).classes('flex-1')
+            title_input = ui.input(label='Course title').classes('flex-1')
+
+            def on_add_course():
+                institution = institution_input.value.strip()
+                title = title_input.value.strip()
+                if not institution or not title:
+                    ui.notify('Enter both an institution and a course title.', color='negative')
+                    return
+                with get_session() as session:
+                    create_course(
+                        session, title=title, institution=institution,
+                        created_by_id=app.storage.user['user_id'],
+                    )
+                institution_input.value = ''
+                title_input.value = ''
+                ui.notify(f'Course "{title}" created.', color='positive')
+                refresh_courses()
+
+            ui.button('Add course', on_click=on_add_course, color='primary')
 
     container = ui.column().classes('w-full gap-2')
 
