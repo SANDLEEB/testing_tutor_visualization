@@ -21,11 +21,11 @@ from auth.service import create_password_user
 from core.course_service import create_course, enroll_user
 from core.models import EnrollmentRole
 
-EMAIL = 'you@example.com'
-PASSWORD = 'change-me'
+EMAIL = 'shizaandleeb1@gmail.com'
+PASSWORD = 'shiza786'
 FULL_NAME = 'Admin'
-INSTITUTION = 'My University'
-COURSE_TITLE = 'Default Course'
+INSTITUTION = 'University of Alabama'
+COURSE_TITLE = 'CS101'
 
 with get_session() as session:
     user = create_password_user(session, EMAIL, PASSWORD, FULL_NAME)
